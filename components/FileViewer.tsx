@@ -32,6 +32,20 @@ interface Props {
   onMentionLines?: (relativePath: string, startLine: number, endLine: number) => void;
   gitRefreshKey?: number;
   initialDisplayMode?: DisplayMode;
+  /**
+   * Panel-level view, alongside the per-file source/preview/diff modes.
+   *
+   * It rides in the same switch as the display modes because that is where the
+   * user looks for it, but it is not a display mode: worker activity does not
+   * belong to any file, so it cannot be stored per file path the way
+   * `displayMode` is. The parent owns it.
+   */
+  panelView?: "file" | "agent";
+  onPanelViewChange?: (view: "file" | "agent") => void;
+  /** Rendered in place of the file content while the agent view is active. */
+  agentView?: ReactNode;
+  /** Drives the activity dot on the Agent tab. */
+  agentRunning?: boolean;
 }
 
 interface FileData {
@@ -864,7 +878,7 @@ function DocumentViewer({ filePath, cwd, sourceSessionId }: Props) {
   );
 }
 
-export function FileViewer({ filePath, cwd, sourceSessionId, onOpenFile, onMentionLines, gitRefreshKey, initialDisplayMode }: Props) {
+export function FileViewer({ filePath, cwd, sourceSessionId, onOpenFile, onMentionLines, gitRefreshKey, initialDisplayMode, panelView, onPanelViewChange, agentView }: Props) {
   if (isImagePath(filePath)) {
     return <ImageViewer filePath={filePath} cwd={cwd} sourceSessionId={sourceSessionId} />;
   }
@@ -874,10 +888,10 @@ export function FileViewer({ filePath, cwd, sourceSessionId, onOpenFile, onMenti
   if (isDocumentPreviewPath(filePath)) {
     return <DocumentViewer filePath={filePath} cwd={cwd} sourceSessionId={sourceSessionId} />;
   }
-  return <TextFileViewer filePath={filePath} cwd={cwd} sourceSessionId={sourceSessionId} onOpenFile={onOpenFile} onMentionLines={onMentionLines} gitRefreshKey={gitRefreshKey} initialDisplayMode={initialDisplayMode} />;
+  return <TextFileViewer filePath={filePath} cwd={cwd} sourceSessionId={sourceSessionId} onOpenFile={onOpenFile} onMentionLines={onMentionLines} gitRefreshKey={gitRefreshKey} initialDisplayMode={initialDisplayMode} panelView={panelView} onPanelViewChange={onPanelViewChange} agentView={agentView} />;
 }
 
-function TextFileViewer({ filePath, cwd, sourceSessionId, onOpenFile, onMentionLines, gitRefreshKey, initialDisplayMode }: Props) {
+function TextFileViewer({ filePath, cwd, sourceSessionId, onOpenFile, onMentionLines, gitRefreshKey, initialDisplayMode, panelView = "file", onPanelViewChange, agentView, agentRunning }: Props) {
   const { isDark } = useTheme();
   const { t } = useI18n();
   const [data, setData] = useState<FileData | null>(null);
@@ -1138,15 +1152,20 @@ function TextFileViewer({ filePath, cwd, sourceSessionId, onOpenFile, onMentionL
         watching={watching}
         sourceSessionId={sourceSessionId}
       >
-        {displayModes.length > 1 && (
+        {(displayModes.length > 1 || agentView) && (
           <div className="file-viewer-mode-switch" aria-label={t("i18n.fileViewMode")}>
             {displayModes.map((mode) => {
-              const active = effectiveDisplayMode === mode;
+              const active = panelView !== "agent" && effectiveDisplayMode === mode;
               return (
                 <button
                   key={mode}
                   type="button"
-                  onClick={() => setDisplayMode(mode)}
+                  onClick={() => {
+                    setDisplayMode(mode);
+                    // Switching display mode is a statement that the user wants
+                    // to look at the file again, so it also leaves the agent view.
+                    onPanelViewChange?.("file");
+                  }}
                   title={mode === "diff" ? t("i18n.compareHead") : undefined}
                   aria-pressed={active}
                   className="file-viewer-mode-button"
@@ -1155,6 +1174,18 @@ function TextFileViewer({ filePath, cwd, sourceSessionId, onOpenFile, onMentionL
                 </button>
               );
             })}
+            {agentView && (
+              <button
+                type="button"
+                onClick={() => onPanelViewChange?.(panelView === "agent" ? "file" : "agent")}
+                aria-pressed={panelView === "agent"}
+                title={panelView === "agent" ? "Back to the file" : "Show what the subagent is doing"}
+                className={`file-viewer-mode-button${panelView === "agent" ? " is-agent-active" : ""}`}
+              >
+                Agent
+                {agentRunning && <span className="file-viewer-mode-dot" aria-hidden="true" />}
+              </button>
+            )}
           </div>
         )}
 
@@ -1195,8 +1226,16 @@ function TextFileViewer({ filePath, cwd, sourceSessionId, onOpenFile, onMentionL
       </FileViewerToolbar>
 
       {/* Content area */}
-      <div ref={contentRef} className="file-viewer-content" style={{ flex: 1, overflow: "auto", background: "var(--bg)" }}>
-        {effectiveDisplayMode === "diff" && hasGitDiff ? (
+      <div
+        ref={contentRef}
+        className="file-viewer-content"
+        style={
+          panelView === "agent"
+            ? { flex: 1, minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden", background: "var(--bg)" }
+            : { flex: 1, overflow: "auto", background: "var(--bg)" }
+        }
+      >
+        {panelView === "agent" ? agentView : effectiveDisplayMode === "diff" && hasGitDiff ? (
           <DiffView patch={gitDiff.patch!} />
         ) : isHtml && effectiveDisplayMode === "preview" ? (
           <iframe

@@ -60,3 +60,7 @@ next-env.d.ts
 # local tooling artifacts
 .playwright-mcp/
 pi-gui-session-preview.png
+
+# locally built installers and the local test baseline snapshot
+/release/
+/.test-baseline.json

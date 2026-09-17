@@ -8,6 +8,10 @@ import { validateAgentImages } from "./image-attachments";
 import { invalidateModelsCache } from "./models-cache";
 import { resolveVisibleModels, selectInitialModelScope } from "./model-scope";
 import { extractTextContent } from "./session-scan";
+import { createSubagentTool } from "./subagent";
+import { SUBAGENT_TOOL_NAME } from "./subagent/activity";
+import { applyDelegationPrefix } from "./subagent/dispatch-prefix";
+import { readSubagentConfig } from "./subagent/config";
 import { cacheSessionPath, invalidateSessionListCache } from "./session-reader";
 import { getProjectTrustStatus, projectTrustReloadOptions } from "./project-trust";
 import { persistExplicitStartupPreferences } from "./startup-preferences";
@@ -107,6 +111,17 @@ export interface LiveSessionSnapshot {
 }
 
 const CODING_TOOL_NAMES = ["read", "bash", "edit", "write", "grep", "find", "ls"];
+
+/**
+ * Tools that change the world, as opposed to inspecting it.
+ *
+ * When "always delegate" is on, the orchestrator keeps the read-only tools —
+ * it needs them to plan and to verify whatever the worker reports back — and
+ * loses these, which is what actually forces the work out to a worker. Prompt
+ * wording alone could not do this: a model that is asked nicely to delegate
+ * still finds it easier to just edit the file itself.
+ */
+const MUTATING_TOOL_NAMES = new Set(["edit", "write", "bash", "powershell"]);
 
 // Extensions require a complete Theme, while the web UI applies its own styling.
 class PlainTextTheme extends Theme {
@@ -415,6 +430,68 @@ export class AgentSessionWrapper {
     this.onDestroyCallback = cb;
   }
 
+  /**
+   * Apply per-turn delegation settings to an outgoing user message.
+   *
+   * Reading the config here rather than at session construction is what makes
+   * the "always delegate" toggle live: an open session picks up the change on
+   * its next turn instead of needing to be recreated.
+   *
+   * Two things happen together, and both are needed:
+   *  - the tool set is narrowed (or restored), which is what actually forces
+   *    the work out to a worker;
+   *  - a policy block is prefixed to the message, which tells the orchestrator
+   *    what the narrowed tool set means and how to hand work over.
+   */
+  private applyTurnPolicy(message: string): string {
+    try {
+      const config = readSubagentConfig();
+      this.applyTurnToolScope(config.autoDispatch);
+      return applyDelegationPrefix(message, config);
+    } catch {
+      // A malformed or unreadable config must never block the user's message.
+      return message;
+    }
+  }
+
+  /**
+   * Narrow the active tools while delegation is on, and restore them when it
+   * is off.
+   *
+   * The baseline is captured lazily, on the first turn that needs it. By then
+   * extension binding has finished, so the captured set includes
+   * extension-provided tools; capturing at construction time would miss them
+   * and then wrongly "restore" a smaller set than the session actually had.
+   */
+  private applyTurnToolScope(delegating: boolean): void {
+    const baseline = this.ensureToolBaseline();
+    if (!baseline) return;
+
+    if (!delegating) {
+      this.inner.setActiveToolsByName(baseline);
+      return;
+    }
+
+    const scoped = baseline.filter((name) => !MUTATING_TOOL_NAMES.has(name));
+    // Refuse to narrow in a way that would leave the session unable to act at
+    // all: with no worker available the orchestrator would have no way to do
+    // any real work, and no way to tell the user why.
+    if (scoped.length === 0 || !scoped.includes(SUBAGENT_TOOL_NAME)) return;
+    if (scoped.length === baseline.length) return;
+    this.inner.setActiveToolsByName(scoped);
+  }
+
+  private baselineToolNames: string[] | null = null;
+
+  /** The session's full tool set, captured once and reused for restores. */
+  private ensureToolBaseline(): string[] | null {
+    if (!this.baselineToolNames) {
+      const active = this.inner.getActiveToolNames();
+      if (active.length > 0) this.baselineToolNames = [...active];
+    }
+    return this.baselineToolNames;
+  }
+
   async send(command: Record<string, unknown>): Promise<unknown> {
     this.resetIdleTimer();
     const type = command.type as string;
@@ -433,9 +510,14 @@ export class AgentSessionWrapper {
         // Fire and forget — events come via subscribe
         const promptImages = command.images as Array<{ type: "image"; data: string; mimeType: string }> | undefined;
         const streamingBehavior = command.streamingBehavior as "steer" | "followUp" | undefined;
+        // Read the setting per turn rather than once per session: toggling
+        // "always delegate" in the UI has to take effect on the next message,
+        // not after a session restart. The policy rides along with the user
+        // turn because system-prompt guidelines are routinely ignored.
+        const outgoingMessage = this.applyTurnPolicy(command.message as string);
         this.promptRunning = true;
         notifyRunningChange();
-        this.inner.prompt(command.message as string, {
+        this.inner.prompt(outgoingMessage, {
           ...(promptImages?.length ? { images: promptImages } : {}),
           ...(streamingBehavior ? { streamingBehavior } : {}),
           source: "rpc",
@@ -1338,6 +1420,13 @@ export async function startRpcSession(
       ...(initial.thinkingLevel ? { thinkingLevel: initial.thinkingLevel } : {}),
       ...(initial.scopedModels.length > 0 ? { scopedModels: initial.scopedModels } : {}),
       ...(toolsOption !== undefined ? { tools: toolsOption } : {}),
+      // Register the delegation tool in-process rather than relying on a
+      // `pi` subprocess or a ~/.pi/agent/extensions install: the desktop build
+      // has to carry this feature inside the installer. Passing it through
+      // `tools: []` still disables it, because that path is an allow-list.
+      // Built per session because the "dispatch by default" preference is baked
+      // into the tool's prompt guidance.
+      customTools: [createSubagentTool()],
     });
 
     const persistedPreferences = await persistExplicitStartupPreferences(

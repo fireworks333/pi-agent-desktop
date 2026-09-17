@@ -7,8 +7,14 @@ const runningEventsSource = await readFile(new URL("./running/events/route.ts", 
 const eventWireSource = await readFile(new URL("../../../lib/agent-event-wire.ts", import.meta.url), "utf8");
 
 test("agent SSE projects SDK events onto the fields consumed by the web client", () => {
-  assert.match(eventWireSource, /OMITTED_EVENT_TYPES = new Set\(\["turn_start", "turn_end", "tool_execution_update"\]\)/);
+  assert.match(eventWireSource, /OMITTED_EVENT_TYPES = new Set\(\["turn_start", "turn_end"\]\)/);
   assert.match(eventWireSource, /delete assistantMessageEvent\.partial/);
+  // tool_execution_update carries the subagent's live details to the activity
+  // panel. Only `details` crosses the wire, and anything over the cap is
+  // dropped rather than truncated, so one tool cannot blow up the stream.
+  assert.match(eventWireSource, /event\.type === "tool_execution_update"/);
+  assert.match(eventWireSource, /details: partialResult\.details/);
+  assert.match(eventWireSource, /MAX_TOOL_UPDATE_BYTES/);
   assert.match(eventWireSource, /event\.type === "agent_end"\) return \{ type: "agent_end" \}/);
   assert.match(agentEventsSource, /const clientEvent = projectAgentEventForClient\(event\)/);
 });

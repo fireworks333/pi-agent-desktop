@@ -505,6 +505,20 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
   const [modelDropdownOpen, setModelDropdownOpen] = useState(false);
   const [modelDropdownRect, setModelDropdownRect] = useState<{ top: number; left: number; width: number } | null>(null);
   const [modelFilter, setModelFilter] = useState("");
+  const [workerDropdownOpen, setWorkerDropdownOpen] = useState(false);
+  const [workerDropdownRect, setWorkerDropdownRect] = useState<{ top: number; left: number; width: number } | null>(null);
+  const [workerModel, setWorkerModel] = useState<{ provider: string; modelId: string } | null>(null);
+  const [autoDispatch, setAutoDispatch] = useState(false);
+  /**
+   * How much of the toolbar row still fits.
+   *
+   * Measured with a ResizeObserver rather than a CSS container query: marking a
+   * content-sized flex item as a container (`container-type: inline-size`) makes
+   * its width independent of its contents, so the row collapsed to zero and
+   * every control inside vanished at once.
+   */
+  const toolbarRowRef = useRef<HTMLDivElement>(null);
+  const [toolbarCompact, setToolbarCompact] = useState<"full" | "compact" | "narrow" | "tiny">("full");
   const [toolDropdownOpen, setToolDropdownOpen] = useState(false);
   const [thinkingDropdownOpen, setThinkingDropdownOpen] = useState(false);
   const [controlsMenuOpen, setControlsMenuOpen] = useState(false);
@@ -542,6 +556,8 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
   const dropdownRef = useRef<HTMLDivElement>(null);
   const projectDropdownRef = useRef<HTMLDivElement>(null);
   const modelDropdownPanelRef = useRef<HTMLDivElement>(null);
+  const workerDropdownRef = useRef<HTMLDivElement>(null);
+  const workerDropdownPanelRef = useRef<HTMLDivElement>(null);
   const toolDropdownRef = useRef<HTMLDivElement>(null);
   const thinkingDropdownRef = useRef<HTMLDivElement>(null);
   const controlsMenuRef = useRef<HTMLDivElement>(null);
@@ -1431,6 +1447,22 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
     else modelsByProvider.push({ provider: opt.provider, options: [opt] });
   }
 
+  // The subagent picker has no filter box of its own, so it groups the full
+  // option list rather than reusing the main dropdown's filtered grouping.
+  const workerModelsByProvider: { provider: string; options: ModelOption[] }[] = [];
+  for (const opt of modelOptions) {
+    const group = workerModelsByProvider.find((g) => g.provider === opt.provider);
+    if (group) group.options.push(opt);
+    else workerModelsByProvider.push({ provider: opt.provider, options: [opt] });
+  }
+
+  const workerOption = workerModel
+    ? modelOptions.find((o) => o.provider === workerModel.provider && o.modelId === workerModel.modelId)
+    : undefined;
+  const workerLabel = workerModel ? (workerOption?.name ?? workerModel.modelId) : "Inherit model";
+  const isWorkerActive = (opt: ModelOption) =>
+    workerModel !== null && opt.provider === workerModel.provider && opt.modelId === workerModel.modelId;
+
   const displayModelName = model
     ? (modelOptions.find((o) => o.modelId === model.modelId && o.provider === model.provider)?.name ?? model.modelId)
     : null;
@@ -1449,6 +1481,80 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
   })();
   const toolPresetLabel = Object.entries(TOOL_PRESET_MAP).find(([, v]) => v === (toolPreset ?? "default"))?.[0] ?? "default";
 
+  // Subagent worker model and dispatch preference: persisted server-side in the
+  // pi agent dir, so they survive restarts and apply to every project rather
+  // than one session.
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await fetch("/api/subagent-config", { cache: "no-store" });
+        if (!res.ok) return;
+        const data = await res.json() as {
+          workerModel?: { provider?: unknown; modelId?: unknown } | null;
+          autoDispatch?: unknown;
+        };
+        if (cancelled) return;
+        if (data.autoDispatch === true) setAutoDispatch(true);
+        const stored = data.workerModel;
+        if (!stored) return;
+        if (typeof stored.provider === "string" && typeof stored.modelId === "string") {
+          setWorkerModel({ provider: stored.provider, modelId: stored.modelId });
+        }
+      } catch {
+        // The setting is optional; a failed read just means "inherit" + manual dispatch.
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  /**
+   * Persist both subagent settings together.
+   *
+   * The route replaces the whole config, so sending one field at a time would
+   * silently clear the other.
+   */
+  const persistSubagentConfig = useCallback(async (
+    next: { workerModel: { provider: string; modelId: string } | null; autoDispatch: boolean },
+  ) => {
+    const previous = { workerModel, autoDispatch };
+    setWorkerModel(next.workerModel);
+    setAutoDispatch(next.autoDispatch);
+    try {
+      const res = await fetch("/api/subagent-config", {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(next),
+      });
+      if (!res.ok) throw new Error(await res.text());
+    } catch {
+      // Keep the controls honest: if the write did not land, do not show it as saved.
+      setWorkerModel(previous.workerModel);
+      setAutoDispatch(previous.autoDispatch);
+    }
+  }, [workerModel, autoDispatch]);
+
+  const updateWorkerModel = useCallback((next: { provider: string; modelId: string } | null) => {
+    return persistSubagentConfig({ workerModel: next, autoDispatch });
+  }, [persistSubagentConfig, autoDispatch]);
+
+  const updateAutoDispatch = useCallback((next: boolean) => {
+    return persistSubagentConfig({ workerModel, autoDispatch: next });
+  }, [persistSubagentConfig, workerModel]);
+
+  // Drop toolbar labels as the row narrows. Thresholds are on the row's own
+  // content width, so they hold whether the window or the panel is what shrank.
+  useEffect(() => {
+    const node = toolbarRowRef.current;
+    if (!node || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver((entries) => {
+      const width = entries[0]?.contentRect.width ?? 0;
+      setToolbarCompact(width < 430 ? "tiny" : width < 560 ? "narrow" : width < 680 ? "compact" : "full");
+    });
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, []);
+
   // Close dropdowns on outside click
   useEffect(() => {
     const handler = (e: MouseEvent) => {
@@ -1461,6 +1567,12 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
       }
       if (toolDropdownRef.current && !toolDropdownRef.current.contains(e.target as Node)) {
         setToolDropdownOpen(false);
+      }
+      if (
+        workerDropdownRef.current && !workerDropdownRef.current.contains(e.target as Node) &&
+        workerDropdownPanelRef.current && !workerDropdownPanelRef.current.contains(e.target as Node)
+      ) {
+        setWorkerDropdownOpen(false);
       }
       if (thinkingDropdownRef.current && !thinkingDropdownRef.current.contains(e.target as Node)) {
         setThinkingDropdownOpen(false);
@@ -2225,7 +2337,11 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
         }}>
 
           {/* LEFT: project context + model selector (idle) or steer/followup toggle (streaming) */}
-          <div style={{ flex: isMobile ? "1 1 auto" : "0 0 auto", minWidth: 0, display: "flex", alignItems: "center", gap: 2 }}>
+          <div
+            ref={toolbarRowRef}
+            className={`composer-toolbar-row${toolbarCompact === "full" ? "" : ` is-${toolbarCompact}`}`}
+            style={{ flex: "1 1 auto", minWidth: 0, display: "flex", alignItems: "center", gap: 2 }}
+          >
             {projectLabel && (
               <div ref={projectDropdownRef} style={{ position: "relative", flexShrink: 0 }}>
                 <button
@@ -2465,6 +2581,198 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                     );
                   })()}
                 </div>
+            )}
+            {/* Subagent picker — the model delegated ("hands") work runs on.
+                Deliberately sits next to the session model so the split between
+                the planning model and the execution model is visible at a glance. */}
+            {onModelChange && modelOptions.length > 0 && (
+                <div ref={workerDropdownRef} style={{ position: "relative", minWidth: 0 }}>
+                  <button
+                    className="native-toolbar-button subagent-model-picker"
+                    onClick={(e) => {
+                      const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+                      setWorkerDropdownRect({ top: rect.top, left: rect.left, width: rect.width });
+                      setWorkerDropdownOpen((open) => !open);
+                    }}
+                    disabled={isStreaming}
+                    style={{
+                      display: "flex", alignItems: "center", gap: 6,
+                      padding: isMobile ? "8px 10px" : "8px 12px",
+                      height: 32,
+                      maxWidth: isMobile ? "100%" : 220,
+                      overflow: "hidden",
+                      background: workerDropdownOpen ? "var(--bg-hover)" : "none",
+                      border: "none",
+                      borderRadius: 9,
+                      color: workerModel ? "var(--text)" : "var(--text-dim)",
+                      cursor: isStreaming ? "not-allowed" : "pointer",
+                      fontSize: 12,
+                      opacity: isStreaming ? 0.5 : 1,
+                      transition: "background 0.12s, color 0.12s",
+                    }}
+                    onMouseEnter={(e) => {
+                      if (isStreaming) return;
+                      e.currentTarget.style.background = "var(--bg-hover)";
+                    }}
+                    onMouseLeave={(e) => {
+                      e.currentTarget.style.background = workerDropdownOpen ? "var(--bg-hover)" : "none";
+                    }}
+                    title={workerModel
+                      ? `Subagent model — delegated tasks run on ${workerLabel}`
+                      : "Subagent model — currently inherits the main session model"}
+                  >
+                    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
+                      <path d="M9 3H5a2 2 0 0 0-2 2v4" /><path d="M9 21H5a2 2 0 0 1-2-2v-4" />
+                      <path d="M15 3h4a2 2 0 0 1 2 2v4" /><path d="M15 21h4a2 2 0 0 0 2-2v-4" />
+                      <circle cx="12" cy="12" r="2" />
+                    </svg>
+                    <span className="subagent-model-label" style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>
+                      {workerLabel}
+                    </span>
+                  </button>
+                  {workerDropdownOpen && workerDropdownRect && (() => {
+                    const viewportHeight = window.visualViewport?.height ?? window.innerHeight;
+                    const bottom = viewportHeight - workerDropdownRect.top + 6;
+                    const maxH = Math.max(120, Math.min(workerDropdownRect.top - 8, viewportHeight * 0.6));
+                    const panelPos: React.CSSProperties = isMobile
+                      ? { left: 8, right: 8, maxWidth: "calc(100vw - 16px)" }
+                      : { left: workerDropdownRect.left, width: "max-content", minWidth: workerDropdownRect.width };
+                    return (
+                      <div ref={workerDropdownPanelRef} className="native-popover" style={{
+                        position: "fixed",
+                        bottom,
+                        ...panelPos,
+                        zIndex: 500, background: "var(--bg)", border: "1px solid var(--border)",
+                        borderRadius: 8, boxShadow: "0 -4px 16px rgba(0,0,0,0.10)",
+                        overflow: "hidden", maxHeight: maxH, display: "flex", flexDirection: "column",
+                      }}>
+                        <button
+                          onClick={() => {
+                            setWorkerDropdownOpen(false);
+                            void updateWorkerModel(null);
+                          }}
+                          style={{
+                            display: "flex", alignItems: "center", gap: 8,
+                            width: "100%", padding: "8px 12px",
+                            background: workerModel === null ? "var(--bg-selected)" : "none",
+                            border: "none",
+                            borderBottom: "1px solid var(--border)",
+                            color: workerModel === null ? "var(--text)" : "var(--text-muted)",
+                            cursor: "pointer", fontSize: 12, textAlign: "left",
+                            fontWeight: workerModel === null ? 600 : 400,
+                            whiteSpace: "nowrap",
+                          }}
+                          onMouseEnter={(e) => { if (workerModel !== null) e.currentTarget.style.background = "var(--bg-hover)"; }}
+                          onMouseLeave={(e) => { if (workerModel !== null) e.currentTarget.style.background = "none"; }}
+                        >
+                          {workerModel === null
+                            ? <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="var(--accent)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}><polyline points="1.5 5 4 7.5 8.5 2.5" /></svg>
+                            : <span style={{ width: 10, flexShrink: 0 }} />}
+                          Inherit the main session model
+                        </button>
+                        <div style={{ minHeight: 0, overflowY: "auto" }}>
+                          {workerModelsByProvider.map((group, gi) => (
+                            <div key={group.provider}>
+                              {(workerModelsByProvider.length > 1) && (
+                                <div style={{
+                                  padding: "6px 12px 4px",
+                                  fontSize: 10, fontWeight: 600, color: "var(--text-dim)",
+                                  textTransform: "uppercase", letterSpacing: "0.07em",
+                                  borderTop: gi > 0 ? "1px solid var(--border)" : "none",
+                                }}>
+                                  {group.provider}
+                                </div>
+                              )}
+                              {group.options.map((opt) => {
+                                const active = isWorkerActive(opt);
+                                return (
+                                  <button
+                                    key={`${opt.provider}:${opt.modelId}`}
+                                    onClick={() => {
+                                      setWorkerDropdownOpen(false);
+                                      void updateWorkerModel({ provider: opt.provider, modelId: opt.modelId });
+                                    }}
+                                    style={{
+                                      display: "flex", alignItems: "center", gap: 8,
+                                      width: "100%", padding: "7px 12px",
+                                      background: active ? "var(--bg-selected)" : "none",
+                                      border: "none",
+                                      color: active ? "var(--text)" : "var(--text-muted)",
+                                      cursor: "pointer", fontSize: 12, textAlign: "left",
+                                      fontWeight: active ? 600 : 400,
+                                      whiteSpace: "nowrap",
+                                    }}
+                                    onMouseEnter={(e) => { if (!active) e.currentTarget.style.background = "var(--bg-hover)"; }}
+                                    onMouseLeave={(e) => { if (!active) e.currentTarget.style.background = "none"; }}
+                                  >
+                                    {active
+                                      ? <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="var(--accent)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}><polyline points="1.5 5 4 7.5 8.5 2.5" /></svg>
+                                      : <span style={{ width: 10, flexShrink: 0 }} />}
+                                    {opt.name}
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    );
+                  })()}
+                </div>
+            )}
+            {/* Dispatch preference — the checkbox turns the session's tool
+                guidance into "delegate by default" instead of "delegate when
+                it clearly pays off". */}
+            {onModelChange && (
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={autoDispatch}
+                  className="native-toolbar-button"
+                  onClick={() => { void updateAutoDispatch(!autoDispatch); }}
+                  disabled={isStreaming}
+                  title={autoDispatch
+                    ? "The main model delegates any fully-specifiable task to the subagent by default"
+                    : "The main model decides on its own when to delegate"}
+                  style={{
+                    display: "flex", alignItems: "center", gap: 6,
+                    padding: isMobile ? "8px 10px" : "8px 12px",
+                    height: 32,
+                    background: autoDispatch ? "var(--accent-soft)" : "none",
+                    border: "none",
+                    borderRadius: 9,
+                    color: autoDispatch ? "var(--text)" : "var(--text-muted)",
+                    cursor: isStreaming ? "not-allowed" : "pointer",
+                    fontSize: 12,
+                    whiteSpace: "nowrap",
+                    opacity: isStreaming ? 0.5 : 1,
+                    transition: "background 0.12s, color 0.12s",
+                  }}
+                  onMouseEnter={(e) => { if (!isStreaming && !autoDispatch) e.currentTarget.style.background = "var(--bg-hover)"; }}
+                  onMouseLeave={(e) => { if (!autoDispatch) e.currentTarget.style.background = "none"; }}
+                >
+                  <span
+                    aria-hidden="true"
+                    style={{
+                      width: 13,
+                      height: 13,
+                      flexShrink: 0,
+                      borderRadius: 3,
+                      border: `1.5px solid ${autoDispatch ? "var(--accent)" : "var(--text-dim)"}`,
+                      background: autoDispatch ? "var(--accent)" : "transparent",
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                    }}
+                  >
+                    {autoDispatch && (
+                      <svg width={9} height={9} viewBox="0 0 10 10" fill="none" stroke="var(--accent-contrast)" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+                        <polyline points="1.5 5 4 7.5 8.5 2.5" />
+                      </svg>
+                    )}
+                  </span>
+                  <span className="subagent-toggle-label">Always delegate</span>
+                </button>
             )}
             <ContextUsageRing contextUsage={contextUsage} sessionStats={sessionStats} onOpenStats={onSessionStatsPanelOpen} />
             <ExtensionStatusBar statuses={extensionStatuses} />

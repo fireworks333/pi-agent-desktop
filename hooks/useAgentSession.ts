@@ -16,8 +16,15 @@ import { fetchWithRetry } from "@/lib/fetch-timeout";
 import { getToolNamesForPreset, type ToolEntry } from "@/lib/tool-presets";
 import { rememberScrollPosition, sessionScrollTops } from "@/lib/scroll-memory";
 import { applyAssistantMessageEvent, type ClientAssistantMessageEvent } from "@/lib/streaming-message";
+import { stripDelegationPrefix } from "@/lib/subagent/dispatch-prefix";
 import { modelScopeWarningKey, type ModelScopeWarning } from "@/lib/model-scope-warnings";
 import type { SessionStatsInfo } from "@/lib/pi-types";
+import {
+  readSubagentActivityDetails,
+  upsertSubagentActivity,
+  SUBAGENT_TOOL_NAME,
+  type SubagentActivity,
+} from "@/lib/subagent/activity";
 
 export interface SessionData {
   sessionId: string;
@@ -306,6 +313,46 @@ function userMessageKey(message: Partial<AgentMessage>): string {
   });
 }
 
+/**
+ * Hide the injected delegation policy from the transcript.
+ *
+ * The policy block is addressed to the model, so it belongs in the session
+ * file and in what the model sees — but rendering it in the chat window buries
+ * the user's own words under a wall of boilerplate. Stripping it here, on the
+ * way into `messages`, keeps the stored conversation intact while showing the
+ * person only what they typed.
+ *
+ * This also keeps the optimistic-send reconciliation honest: without it the
+ * echoed message never matches the locally appended one, so the locally
+ * rendered original gets replaced by the injected version.
+ */
+function stripDelegationFromUserMessage(message: AgentMessage): AgentMessage {
+  if ((message as { role?: string }).role !== "user") return message;
+  const content = (message as { content?: unknown }).content;
+
+  if (typeof content === "string") {
+    const stripped = stripDelegationPrefix(content);
+    return stripped === content ? message : ({ ...message, content: stripped } as AgentMessage);
+  }
+  if (!Array.isArray(content)) return message;
+
+  let changed = false;
+  const next = content.map((part) => {
+    if (!part || typeof part !== "object") return part;
+    const text = (part as { text?: unknown }).text;
+    if (typeof text !== "string") return part;
+    const stripped = stripDelegationPrefix(text);
+    if (stripped === text) return part;
+    changed = true;
+    return { ...part, text: stripped };
+  });
+  return changed ? ({ ...message, content: next } as AgentMessage) : message;
+}
+
+function stripDelegationFromMessages(messages: AgentMessage[]): AgentMessage[] {
+  return messages.map(stripDelegationFromUserMessage);
+}
+
 function readCompactResult(result: unknown, reason: string): CompactResultInfo | null {
   if (!result || typeof result !== "object") return null;
   const r = result as CompactCommandResult;
@@ -456,6 +503,14 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const [compactError, setCompactError] = useState<string | null>(null);
   const [compactResult, setCompactResult] = useState<CompactResultInfo | null>(null);
   const [agentPhase, setAgentPhase] = useState<AgentPhase>(null);
+  /**
+   * Rolling log of subagent dispatches for the right-hand activity panel,
+   * newest first, with any still-running worker pinned to the top.
+   *
+   * The worker's reasoning and tool timeline arrive in tool `details`, never in
+   * the tool card's text, which is what keeps them out of the main transcript.
+   */
+  const [subagentActivity, setSubagentActivity] = useState<SubagentActivity[]>([]);
   const [promptAnchorActive, setPromptAnchorActive] = useState(false);
   const [slashCommands, setSlashCommands] = useState<SlashCommandInfo[]>([]);
   const [slashCommandsLoading, setSlashCommandsLoading] = useState(false);
@@ -573,6 +628,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       setCompactError(null);
       setCompactResult(null);
       setAgentPhase(null);
+      setSubagentActivity([]);
       setExtensionDialog(null);
       setExtensionCustomUi(null);
       setExtensionStatuses([]);
@@ -659,7 +715,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       if (!isCurrent()) return null;
       setData(d);
       setActiveLeafId(d.leafId);
-      setMessages(d.context.messages);
+      setMessages(stripDelegationFromMessages(d.context.messages));
       setEntryIds(d.context.entryIds ?? []);
       setCurrentModelOverride(null);
       setError(null);
@@ -724,7 +780,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const d = await res.json() as { context: { messages: AgentMessage[]; entryIds: string[] } };
       if (!isCurrent()) return false;
-      setMessages(d.context.messages);
+      setMessages(stripDelegationFromMessages(d.context.messages));
       setEntryIds(d.context.entryIds ?? []);
       return true;
     } catch (e) {
@@ -1397,7 +1453,10 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           // messages. The run's initial prompt also emits one, but handleSend
           // already appended it optimistically. Consume only the still-adjacent
           // optimistic bubble; later same-text queue deliveries must render.
-          const delivered = normalizeToolCalls(completed);
+          // Strip the injected delegation policy before comparing, otherwise
+          // the echo never matches the optimistic bubble and the transcript
+          // ends up showing the policy text instead of what the user typed.
+          const delivered = stripDelegationFromUserMessage(normalizeToolCalls(completed) as AgentMessage);
           const deliveredKey = userMessageKey(delivered);
           const optimisticKey = optimisticUserMessageKeyRef.current;
           optimisticUserMessageKeyRef.current = null;
@@ -1415,6 +1474,23 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         }
         dispatch({ type: "reset" });
         setAgentPhase({ kind: "waiting_model" });
+        break;
+      }
+      case "tool_execution_update": {
+        // Only the subagent tool publishes structured details on the wire; every
+        // other tool's update is either empty or dropped by the size cap in
+        // lib/agent-event-wire.ts.
+        if (event.toolName !== SUBAGENT_TOOL_NAME) break;
+        const details = readSubagentActivityDetails(event.details);
+        if (!details) break;
+        setSubagentActivity((prev) =>
+          upsertSubagentActivity(prev, {
+            toolCallId: String(event.toolCallId ?? ""),
+            details,
+            finished: details.status !== "running",
+            updatedAt: Date.now(),
+          }),
+        );
         break;
       }
       case "tool_execution_start": {
@@ -1435,6 +1511,11 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           if (tools.length === 0) return { kind: "waiting_model" };
           return { kind: "running_tools", tools };
         });
+        setSubagentActivity((prev) =>
+          prev.map((entry) =>
+            entry.toolCallId === id ? { ...entry, finished: true, updatedAt: Date.now() } : entry,
+          ),
+        );
         break;
       }
       case "queue_update":
@@ -2194,6 +2275,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     notices: noticeState.visible, extensionDialog, extensionCustomUi, extensionStatuses, extensionWidgets, respondToExtensionUi, sendExtensionCustomInput,
     isAutoModelSelection: isNew && newSessionModel === null,
     agentPhase,
+    subagentActivity,
     isNew,
     promptAnchorActive,
     addNotice,

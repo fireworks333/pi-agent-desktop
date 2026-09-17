@@ -4780,3 +4780,71 @@ span.linenumber {
     padding-inline: 10px;
   }
 }
+
+/* Subagent activity strip */
+
+@keyframes subagent-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.subagent-spinner {
+  animation: subagent-spin 0.9s linear infinite;
+  transform-origin: 50% 50%;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .subagent-spinner {
+    animation-duration: 2.4s;
+  }
+}
+
+
+
+
+/* Composer toolbar overflow.
+   Two model pickers plus the delegate toggle and the context ring can outgrow a
+   narrow composer. The row carries a compactness class measured in JS rather
+   than a container query: `container-type: inline-size` makes an element's
+   width independent of its content, which collapses a flex item that is sized
+   by its content — the whole row vanished instead of shrinking. */
+
+.composer-toolbar-row.is-compact .subagent-toggle-label {
+  display: none;
+}
+
+.composer-toolbar-row.is-narrow .subagent-toggle-label,
+.composer-toolbar-row.is-narrow .subagent-model-label {
+  display: none;
+}
+
+.composer-toolbar-row.is-tiny .subagent-toggle-label,
+.composer-toolbar-row.is-tiny .subagent-model-label,
+.composer-toolbar-row.is-tiny .subagent-model-picker {
+  display: none;
+}
+
+
+/* Agent tab, the third entry in the file view switch. Active state reuses the
+   shared [aria-pressed] styling; only the activity dot is new. */
+
+.file-viewer-mode-button.is-agent-active {
+  color: var(--text);
+}
+
+.file-viewer-mode-dot {
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  margin-left: 5px;
+  border-radius: 50%;
+  background: var(--accent);
+  vertical-align: middle;
+  animation: subagent-dot-pulse 1.4s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .file-viewer-mode-dot {
+    animation: none;
+  }
+}

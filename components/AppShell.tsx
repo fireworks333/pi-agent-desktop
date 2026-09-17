@@ -58,6 +58,13 @@ import type { ProjectTrustStatus } from "@/lib/api-types";
 import type { ChatInputHandle } from "./ChatInput";
 import type { FileExplorerHandle } from "./FileExplorer";
 import type { SessionStatsInfo } from "@/lib/pi-types";
+import { SubagentActivityPanel } from "./SubagentActivityPanel";
+import type { SubagentActivity } from "@/lib/subagent/activity";
+import {
+  describeAgentActivity,
+  hasActiveAgents,
+  type AgentActivityReport,
+} from "@/lib/agent-activity-types";
 
 type AutoNameStatus =
   | { kind: "idle" }
@@ -269,6 +276,43 @@ export function AppShell() {
     setContextUsage(usage);
   }, []);
 
+  /**
+   * Live subagent state for the right-hand activity section.
+   *
+   * `dismissed` is per-dispatch rather than global: closing the section hides
+   * the current worker's reasoning without suppressing the next one, which is
+   * what "show me what the hands are doing" implies.
+   */
+  const [subagentActivity, setSubagentActivity] = useState<SubagentActivity[]>([]);
+  const [subagentActivityCollapsed, setSubagentActivityCollapsed] = useState(false);
+  /**
+   * Which view fills the right panel's content area.
+   *
+   * Panel-level rather than per-file: the worker's activity does not belong to
+   * any one file, so it cannot ride on FileViewer's source/preview/diff mode
+   * (switching files would reset it). Kept here so the toggle survives both
+   * file switches and the agent view itself.
+   */
+  const [rightPanelView, setRightPanelView] = useState<"file" | "agent">("file");
+  const handleSubagentActivityChange = useCallback((activity: SubagentActivity[]) => {
+    setSubagentActivity(activity);
+  }, []);
+
+  // Reveal the agent view once per dispatch so the worker's reasoning is
+  // visible without hunting for it. Only the first dispatch of a run takes
+  // over the panel; after that the choice is the user's.
+  const subagentAutoOpenedForRef = useRef<string | null>(null);
+  const runningDispatch = subagentActivity.find((entry) => !entry.finished) ?? null;
+  useEffect(() => {
+    const toolCallId = runningDispatch?.toolCallId ?? null;
+    if (!toolCallId || subagentAutoOpenedForRef.current === toolCallId) return;
+    subagentAutoOpenedForRef.current = toolCallId;
+    setRightPanelView("agent");
+    setRightPanelOpen(true);
+  }, [runningDispatch]);
+
+  const hasRunningDispatch = runningDispatch !== null;
+
   // Single active panel — only one dropdown open at a time
   const [activeTopPanel, setActiveTopPanel] = useState<"branches" | "system" | "session" | null>(null);
   const [topMoreOpen, setTopMoreOpen] = useState(false);
@@ -398,6 +442,38 @@ export function AppShell() {
 
   const initialSessionId = initialNavigation.sessionId;
   const [activeCwd, setActiveCwd] = useState<string | null>(null);
+  /**
+   * Concurrent-agent detector.
+   *
+   * Purely advisory: it answers "is something else likely to be editing this
+   * tree right now", which is the question that has to be settled before a
+   * whole-repo edit. It never blocks anything by itself.
+   */
+  const [agentActivity, setAgentActivity] = useState<AgentActivityReport | null>(null);
+  useEffect(() => {
+    const cwd = activeCwd;
+    if (!cwd) {
+      setAgentActivity(null);
+      return;
+    }
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const res = await fetch(`/api/agent-activity?cwd=${encodeURIComponent(cwd)}`, { cache: "no-store" });
+        if (!res.ok) return;
+        const report = await res.json() as AgentActivityReport;
+        if (!cancelled) setAgentActivity(report);
+      } catch {
+        // Advisory only; a failed scan hides the indicator rather than erroring.
+      }
+    };
+    void load();
+    const timer = setInterval(load, 20_000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [activeCwd]);
   const activeProjectRootRef = useRef<string | null>(null);
   // True once the initial ?session= URL param has been resolved (or confirmed absent)
   const [initialSessionRestored, setInitialSessionRestored] = useState<boolean>(() => !initialSessionId);
@@ -1539,6 +1615,7 @@ export function AppShell() {
               onSessionStatsChange={handleSessionStatsChange}
               onSessionStatsPanelOpen={openSessionStatsPanel}
               onContextUsageChange={handleContextUsageChange}
+              onSubagentActivityChange={handleSubagentActivityChange}
               onSelectProject={desktopMode ? () => void handleSelectProjectFromComposer() : undefined}
               projectOptions={selectedSession ? [] : availableProjectRoots}
               onProjectChange={selectedSession ? undefined : handleProjectChangeFromComposer}
@@ -1588,6 +1665,41 @@ export function AppShell() {
         </div>
       </div>
 
+      {/* Advisory badge: it only appears when something else looks active, so
+          its presence is the signal. Detail lives in the tooltip. */}
+      {hasActiveAgents(agentActivity) && agentActivity && (
+        <div
+          role="status"
+          title={[
+            describeAgentActivity(agentActivity),
+            ...agentActivity.agents.map(
+              (agent) => `${agent.label} — ${agent.kind}, ${Math.round(agent.ageMs / 1000)}s ago (${agent.detail})`,
+            ),
+            ...agentActivity.gitLocks.map((lock) => `git lock: ${lock}`),
+          ].join("\n")}
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 6,
+            alignSelf: "center",
+            marginRight: 4,
+            padding: "4px 9px",
+            borderRadius: 8,
+            border: "1px solid var(--warning)",
+            background: "var(--bg-panel)",
+            color: "var(--text)",
+            fontSize: 11,
+            whiteSpace: "nowrap",
+            cursor: "default",
+          }}
+        >
+          <svg width={12} height={12} viewBox="0 0 24 24" fill="none" stroke="var(--warning)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <path d="M12 9v4M12 17h.01" />
+            <path d="M10.3 3.9 2.4 18a2 2 0 0 0 1.7 3h15.8a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z" />
+          </svg>
+          {describeAgentActivity(agentActivity)}
+        </div>
+      )}
       <button
         type="button"
         className={`right-panel-toggle-button${rightPanelOpen ? " is-open" : ""}`}
@@ -1752,7 +1864,10 @@ export function AppShell() {
               </button>
             </div>
           </div>
-        {/* Local files: preview on the left, project tree on the right. */}
+        {/* Local files: preview on the left, project tree on the right. The
+            agent view is not a sibling of this block — it is rendered inside
+            the file viewer's content area so the Agent tab can live in the same
+            switch as Source and Preview. */}
         <div style={{ display: "flex", flex: 1, minHeight: 0 }}>
           {/* Preview column */}
           <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", overflow: "hidden" }}>
@@ -1770,6 +1885,26 @@ export function AppShell() {
                     getFileName(filePath),
                     { sourceSessionId: activeFileTab.sourceSessionId },
                   )}
+                  panelView={rightPanelView}
+                  onPanelViewChange={(view) => setRightPanelView(view)}
+                  agentRunning={hasRunningDispatch}
+                  agentView={
+                    <SubagentActivityPanel
+                      activity={subagentActivity}
+                      collapsed={subagentActivityCollapsed}
+                      onToggleCollapsed={() => setSubagentActivityCollapsed((value) => !value)}
+                      onClose={() => setRightPanelView("file")}
+                    />
+                  }
+                />
+              ) : rightPanelView === "agent" ? (
+                /* No file open means no file toolbar to hang the Agent tab on,
+                   so the agent view takes the empty column outright. */
+                <SubagentActivityPanel
+                  activity={subagentActivity}
+                  collapsed={subagentActivityCollapsed}
+                  onToggleCollapsed={() => setSubagentActivityCollapsed((value) => !value)}
+                  onClose={() => setRightPanelView("file")}
                 />
               ) : (
                 <div className="file-panel-empty-state">
